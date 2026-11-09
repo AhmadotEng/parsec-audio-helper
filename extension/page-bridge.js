@@ -1,3 +1,6 @@
+// A previous bridge remains in the page when the extension is reloaded.
+// Reuse it instead of installing duplicate message handlers or capture logic.
+if (!globalThis.ParsecAudioOnly || !globalThis.ParsecMicrophone) {
 
   /*
  * Experimental, reversible Parsec WEB CLIENT video-pause helper.
@@ -86,6 +89,40 @@
       microphoneReturn: "not provided",
       measuredVideoStopped: false
     };
+  }
+
+  // Inspect the selected ICE pair, not the system's default internet route.
+  // Parsec's current web transport keeps its RTCPeerConnection in transport.b.
+  async function connectionPath() {
+    try {
+      const transport = connectedTransport();
+      const peer = transport.b;
+      if (!peer || typeof peer.getStats !== "function") return "unknown";
+      const stats = await Promise.race([
+        peer.getStats(),
+        new Promise(resolve => global.setTimeout(() => resolve(null), 1200))
+      ]);
+      if (!stats || connectedTransport() !== transport) return "unknown";
+      let pair;
+      stats.forEach(report => {
+        if (report.type === "transport" && report.selectedCandidatePairId) {
+          pair = stats.get(report.selectedCandidatePairId);
+        }
+      });
+      if (!pair || pair.state !== "succeeded") return "unknown";
+      const local = stats.get(pair.localCandidateId);
+      const remote = stats.get(pair.remoteCandidateId);
+      if (!local || !remote) return "unknown";
+      const localAddress = local.address || local.ip;
+      const remoteAddress = remote.address || remote.ip;
+      // This exact pair was verified on the user's dedicated Ethernet cable.
+      if (localAddress === "192.168.2.1" && remoteAddress === "192.168.2.100") return "direct";
+      // Chrome may omit networkType or obscure addresses for privacy.
+      const type = String(local.networkType || "").toLowerCase();
+      if (type === "wifi" || type === "wi-fi") return "wifi";
+      if (type === "ethernet") return "ethernet";
+      return "unknown";
+    } catch (_) { return "unknown"; }
   }
 
   function metrics() {
@@ -197,6 +234,7 @@
     enable,
     disable,
     status,
+    connectionPath,
     metrics,
     toggle() {
       return state && state.enabled && isCurrent(state) ? disable() : enable();
@@ -363,6 +401,7 @@
     entry.phase = error ? "error" : "idle";
     entry.cancel(new Error(error ? error.message : "Microphone start was cancelled."));
     global.clearInterval(entry.timer);
+    global.clearInterval(entry.deviceTimer);
     for (const [target, type, listener] of entry.listeners) target.removeEventListener(type, listener);
     entry.listeners.length = 0;
     if (entry.worklet) entry.worklet.port.onmessage = null;
@@ -423,8 +462,8 @@
       if (entry.cancelled) return;
       if (!isCurrent(entry)) {
         finish(entry, new Error("The Parsec connection changed. Reconnect and start the microphone again."));
-      } else if (entry.stream && entry.stream.getAudioTracks().some(track => track.readyState === "ended")) {
-        finish(entry, new Error("The microphone disconnected or stopped. Select an input and start again."));
+      } else if (entry.phase === "running" && entry.stream && entry.stream.getAudioTracks().some(track => track.readyState === "ended")) {
+        refreshInput(entry);
       }
     }, 150);
   }
@@ -482,6 +521,55 @@
     return stream;
   }
 
+  // Keep capture running across Bluetooth disconnects and prefer AirPods again
+  // when macOS exposes them. Never reopen a microphone after Stop/disconnect.
+  async function refreshInput(entry) {
+    if (entry.cancelled || entry.phase !== "running" || entry.switchingInput) return;
+    entry.switchingInput = true;
+    let replacement = null;
+    try {
+      const devices = await global.navigator.mediaDevices.enumerateDevices();
+      if (entry.cancelled || entry.phase !== "running") return;
+      const inputs = devices.filter(d => d.kind === "audioinput" && d.deviceId && d.deviceId !== "default");
+      const airpods = inputs.find(d => /airpods/i.test(d.label) && !/^default\s*[-–—]/i.test(d.label));
+      const track = entry.stream && entry.stream.getAudioTracks()[0];
+      const settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
+      const ended = !track || track.readyState === "ended";
+      const currentAirpods = track && /airpods/i.test(track.label || "");
+      const currentPresent = inputs.some(d => d.deviceId === settings.deviceId || (track && d.label && d.label === track.label));
+      const lostAirpods = currentAirpods && !currentPresent;
+      let target = null;
+      if (airpods && (ended || lostAirpods || (!currentAirpods && settings.deviceId !== airpods.deviceId))) target = airpods.deviceId;
+      else if (ended || lostAirpods) {
+        const fallback = inputs.find(d => !/airpods/i.test(d.label) && !/^default\s*[-–—]/i.test(d.label));
+        target = fallback ? fallback.deviceId : "default";
+      }
+      if (!target) return;
+      const audio = { channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 } };
+      if (target !== "default") audio.deviceId = { exact: target };
+      replacement = await global.navigator.mediaDevices.getUserMedia({ audio, video: false });
+      if (entry.cancelled || entry.phase !== "running" || !isCurrent(entry)) return;
+      const newTrack = replacement.getAudioTracks()[0];
+      if (!newTrack || newTrack.readyState === "ended") return;
+      for (const t of replacement.getAudioTracks()) t.enabled = !entry.muted;
+      const source = entry.context.createMediaStreamSource(replacement);
+      source.connect(entry.worklet);
+      const oldStream = entry.stream, oldSource = entry.source;
+      entry.stream = replacement;
+      entry.source = source;
+      entry.deviceLabel = newTrack.label || null;
+      replacement = null;
+      if (oldSource) oldSource.disconnect();
+      stopTracks(oldStream);
+    } catch (_) {
+      // A Bluetooth device can disappear during selection. Retry on the next
+      // device change or poll, while preserving any still-working input.
+    } finally {
+      stopTracks(replacement);
+      entry.switchingInput = false;
+    }
+  }
+
   async function run(entry, options) {
     try {
       let stream = await requestStream(entry, options.deviceId);
@@ -501,9 +589,6 @@
       const track = stream.getAudioTracks()[0];
       if (track.readyState === "ended") throw new Error("The selected microphone has stopped.");
       entry.deviceLabel = track.label || null;
-      for (const audioTrack of stream.getAudioTracks()) {
-        listen(entry, audioTrack, "ended", () => finish(entry, new Error("The microphone disconnected or stopped. Select an input and start again.")));
-      }
       await Promise.race([entry.resuming, entry.cancellation]);
       assertActive(entry);
       if (entry.resumeError || entry.context.state !== "running") {
@@ -533,6 +618,9 @@
         }
       });
       entry.phase = "running";
+      listen(entry, global.navigator.mediaDevices, "devicechange", () => refreshInput(entry));
+      entry.deviceTimer = global.setInterval(() => refreshInput(entry), 2000);
+      refreshInput(entry);
       return status();
     } catch (error) {
       if (!entry.cancelled) {
@@ -629,7 +717,7 @@
     try {
       let result;
       switch(m.action) {
-        case "status": result={audio:ParsecAudioOnly.status(), metrics:ParsecAudioOnly.metrics(), mic:ParsecMicrophone.status(), devices:await ParsecMicrophone.devices()}; break;
+        case "status": result={audio:ParsecAudioOnly.status(), metrics:ParsecAudioOnly.metrics(), mic:ParsecMicrophone.status(), devices:await ParsecMicrophone.devices(), path:await ParsecAudioOnly.connectionPath()}; break;
         case "video": result=ParsecAudioOnly.toggle(); break;
         case "startMic": result=await ParsecMicrophone.start(m.deviceId ? {deviceId:m.deviceId} : {}); break;
         case "mute": result=ParsecMicrophone.mute(m.value); break;
@@ -642,3 +730,20 @@
     } catch(e) { reply(m.id,false,e); }
   });
 })();
+
+// Notify the extension once per connection, including a session already open
+// when the page bridge starts. No audio or session data is transmitted.
+(function watchParsecConnection() {
+  let wasConnected = false;
+  function check() {
+    const connected = globalThis.ParsecAudioOnly.status().connected;
+    if (connected && !wasConnected) {
+      window.postMessage({ source: "parsec-audio-extension-page", event: "connected" }, location.origin);
+    }
+    wasConnected = connected;
+  }
+  check();
+  setInterval(check, 500);
+})();
+
+}

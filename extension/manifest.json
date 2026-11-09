@@ -3,9 +3,41 @@
   "name": "Parsec Audio Helper",
   "version": "1.0.0",
   "description": "Pause Parsec video and manage optional microphone audio from the toolbar.",
-  "permissions": ["activeTab"],
-  "host_permissions": ["https://web.parsec.app/*"],
-  "action": {"default_title": "Parsec Audio Helper", "default_popup": "popup.html"},
-  "content_scripts": [{"matches": ["https://web.parsec.app/*"], "js": ["content.js"], "run_at": "document_start", "all_frames": false, "world": "ISOLATED"}],
-  "web_accessible_resources": [{"resources": ["page-bridge.js"], "matches": ["https://web.parsec.app/*"]}]
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://web.parsec.app/*"
+  ],
+  "action": {
+    "default_title": "Parsec Audio Helper",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.parsec.app/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page-bridge.js"
+      ],
+      "matches": [
+        "https://web.parsec.app/*"
+      ]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
 }
