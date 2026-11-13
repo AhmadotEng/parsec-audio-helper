@@ -121,6 +121,34 @@ def safe_detach(session, video):
     except Exception:
         pass
 
+def enable_debug_privilege():
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    security = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    security.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    class Luid(ctypes.Structure):
+        _fields_ = [('low', wintypes.DWORD), ('high', wintypes.LONG)]
+    class TokenPrivileges(ctypes.Structure):
+        _fields_ = [('count', wintypes.DWORD), ('luid', Luid), ('attributes', wintypes.DWORD)]
+    security.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(Luid)]
+    security.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TokenPrivileges), wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    token = wintypes.HANDLE()
+    if not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x28, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        privilege = TokenPrivileges(1, Luid(), 2)
+        if not security.LookupPrivilegeValueW(None, 'SeDebugPrivilege', ctypes.byref(privilege.luid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        ctypes.set_last_error(0)
+        if not security.AdjustTokenPrivileges(token, False, ctypes.byref(privilege), 0, None, None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 1300:
+            raise PermissionError('Run Open Parsec Direct.cmd as administrator to access the Parsec host.')
+    finally:
+        kernel.CloseHandle(token)
+
 def main():
     kernel = ctypes.windll.kernel32
     kernel.CreateMutexW.restype = ctypes.c_void_p
@@ -133,6 +161,7 @@ def main():
         return
     print('Parsec Direct Helper')
     print('Keep this window open. Closing it stops the helper.')
+    enable_debug_privilege()
     print('Opening Parsec...')
     os.startfile(SHORTCUT)
     session = video = None
